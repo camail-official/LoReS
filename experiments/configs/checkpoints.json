@@ -1,0 +1,11 @@
+{
+  "qwen3_5": {
+    "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+  },
+  "nemotronh": {
+    "revision": "2dcbcfd95b103843b6ad8e79690f34480ce5a5ae"
+  },
+  "kimi": {
+    "revision": "e1df551a447157d4658b573f9a695d57658590e9"
+  }
+}

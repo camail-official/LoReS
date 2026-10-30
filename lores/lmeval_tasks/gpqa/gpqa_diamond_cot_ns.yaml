@@ -1,0 +1,41 @@
+# GPQA-diamond with the NeMo-Skills MCQ instruction from
+# prompt/config/eval/aai/mcq-4choices.yaml (cb54e911; credits artificialanalysis.ai).
+# Retains lm-eval choice shuffling and "(A)" rendering; paper scores use grade_gpqa.py.
+task: gpqa_diamond_cot_ns
+dataset_path: Idavidrein/gpqa
+dataset_name: gpqa_diamond
+output_type: generate_until
+process_docs: !function utils.process_docs
+training_split: train
+validation_split: train
+test_split: null
+doc_to_text: "Answer the following multiple choice question. The last line of your response should be in the following format: 'Answer: A/B/C/D' (e.g. 'Answer: A').\n\n{{Question}}\n\n(A) {{choice1}}\n(B) {{choice2}}\n(C) {{choice3}}\n(D) {{choice4}}"
+doc_to_target: answer
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: '(?im)^[^\S\r\n]*\**Answer\**[^\S\r\n]*:[^\S\r\n]*(?:(?:\\boxed\{|\\text\{|\\\(|\*\*|\$|\()[^\S\r\n]*)*([A-D])(?=[^\S\r\n]*(?:\r?$|[().,;:!?}\]*$\-–—]|\\\)))'
+        group_select: -1
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "multi_choice_regex"
+        group_select: -1
+        ignore_case: true
+        ignore_punctuation: true
+        regex_pattern: "(\\([A-Z]\\))"
+      - function: "take_first"
+generation_kwargs:
+  until: []
+  do_sample: false
+  temperature: 0.0
+num_fewshot: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+metadata:
+  version: 1.0

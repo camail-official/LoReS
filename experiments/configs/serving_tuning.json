@@ -1,0 +1,178 @@
+{
+  "gdn_fp": {
+    "1": [
+      8,
+      8,
+      2
+    ],
+    "2": [
+      8,
+      8,
+      1
+    ],
+    "4": [
+      32,
+      8,
+      3
+    ],
+    "8": [
+      16,
+      1,
+      3
+    ],
+    "16": [
+      8,
+      1,
+      3
+    ],
+    "32": [
+      8,
+      1,
+      2
+    ],
+    "64": [
+      8,
+      1,
+      2
+    ]
+  },
+  "gdn_int8": {
+    "1": [
+      8,
+      2,
+      2
+    ],
+    "2": [
+      8,
+      1,
+      3
+    ],
+    "4": [
+      8,
+      1,
+      2
+    ],
+    "8": [
+      16,
+      1,
+      2
+    ],
+    "16": [
+      16,
+      1,
+      3
+    ],
+    "32": [
+      16,
+      1,
+      2
+    ],
+    "64": [
+      16,
+      1,
+      1
+    ]
+  },
+  "mamba_fp": {
+    "128": {
+      "BLOCK_SIZE_M": 4,
+      "num_warps": 2
+    },
+    "256": {
+      "BLOCK_SIZE_M": 4,
+      "num_warps": 1
+    },
+    "512": {
+      "BLOCK_SIZE_M": 2,
+      "num_warps": 1
+    },
+    "1024": {
+      "BLOCK_SIZE_M": 8,
+      "num_warps": 4
+    },
+    "2048": {
+      "BLOCK_SIZE_M": 8,
+      "num_warps": 2
+    },
+    "4096": {
+      "BLOCK_SIZE_M": 16,
+      "num_warps": 4
+    },
+    "8192": {
+      "BLOCK_SIZE_M": 16,
+      "num_warps": 4
+    }
+  },
+  "mamba_int8": {
+    "1": [
+      16,
+      8
+    ],
+    "2": [
+      4,
+      1
+    ],
+    "4": [
+      4,
+      1
+    ],
+    "8": [
+      16,
+      2
+    ],
+    "16": [
+      16,
+      2
+    ],
+    "32": [
+      64,
+      8
+    ],
+    "64": [
+      8,
+      1
+    ]
+  },
+  "metadata": {
+    "profiles": {
+      "qwen": {
+        "profile": "qwen",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "gpu_tag": "h100",
+        "state_sr": true,
+        "state_asym": null,
+        "state_fast": false,
+        "batches": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64
+        ],
+        "reps": 7,
+        "search_reps": 3
+      },
+      "nemo": {
+        "profile": "nemo",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "gpu_tag": "h100",
+        "state_sr": true,
+        "state_asym": null,
+        "state_fast": false,
+        "batches": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64
+        ],
+        "reps": 7,
+        "search_reps": 3
+      }
+    }
+  }
+}

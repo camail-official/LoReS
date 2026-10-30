@@ -1,0 +1,6 @@
+"""Grade saved GSM8K outputs."""
+
+from scripts.grading.grading import grading_cli
+
+if __name__ == "__main__":
+    grading_cli("gsm8k")

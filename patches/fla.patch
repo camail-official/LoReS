@@ -1,0 +1,124 @@
+diff --git a/fla/models/delta_net/modeling_delta_net.py b/fla/models/delta_net/modeling_delta_net.py
+index d40e6d34..8bca8dc5 100644
+--- a/fla/models/delta_net/modeling_delta_net.py
++++ b/fla/models/delta_net/modeling_delta_net.py
+@@ -341,7 +341,7 @@ class DeltaNetModel(DeltaNetPreTrainedModel):
+ 
+ class DeltaNetForCausalLM(DeltaNetPreTrainedModel, FLAGenerationMixin):
+ 
+-    _tied_weights_keys = ["lm_head.weight"]
++    _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"}
+ 
+     def __init__(self, config):
+         super().__init__(config)
+diff --git a/fla/models/gated_deltanet/modeling_gated_deltanet.py b/fla/models/gated_deltanet/modeling_gated_deltanet.py
+index 12794013..52b66be4 100644
+--- a/fla/models/gated_deltanet/modeling_gated_deltanet.py
++++ b/fla/models/gated_deltanet/modeling_gated_deltanet.py
+@@ -353,7 +353,7 @@ class GatedDeltaNetModel(GatedDeltaNetPreTrainedModel):
+ 
+ class GatedDeltaNetForCausalLM(GatedDeltaNetPreTrainedModel, FLAGenerationMixin):
+ 
+-    _tied_weights_keys = ["lm_head.weight"]
++    _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"}
+ 
+     def __init__(self, config):
+         super().__init__(config)
+diff --git a/fla/models/kda/modeling_kda.py b/fla/models/kda/modeling_kda.py
+index 39514636..e7c0e134 100644
+--- a/fla/models/kda/modeling_kda.py
++++ b/fla/models/kda/modeling_kda.py
+@@ -370,7 +370,7 @@ class KDAModel(KDAPreTrainedModel):
+ 
+ 
+ class KDAForCausalLM(KDAPreTrainedModel, FLAGenerationMixin):
+-    _tied_weights_keys = ["lm_head.weight"]
++    _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"}
+ 
+     def __init__(self, config):
+         super().__init__(config)
+diff --git a/fla/models/mamba2/modeling_mamba2.py b/fla/models/mamba2/modeling_mamba2.py
+index bc2675ff..123a78f9 100644
+--- a/fla/models/mamba2/modeling_mamba2.py
++++ b/fla/models/mamba2/modeling_mamba2.py
+@@ -331,7 +331,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
+ 
+ 
+ class Mamba2ForCausalLM(Mamba2PreTrainedModel, FLAGenerationMixin):
+-    _tied_weights_keys = []
++    _tied_weights_keys = {}
+ 
+     def __init__(self, config):
+         super().__init__(config)
+diff --git a/fla/models/transformer/modeling_transformer.py b/fla/models/transformer/modeling_transformer.py
+index 19cd0b77..447391be 100644
+--- a/fla/models/transformer/modeling_transformer.py
++++ b/fla/models/transformer/modeling_transformer.py
+@@ -345,7 +345,7 @@ class TransformerModel(TransformerPreTrainedModel):
+ 
+ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
+ 
+-    _tied_weights_keys = ["lm_head.weight"]
++    _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"}
+ 
+     def __init__(self, config):
+         super().__init__(config)
+diff --git a/fla/models/utils.py b/fla/models/utils.py
+index a8027f61..ffc202f5 100644
+--- a/fla/models/utils.py
++++ b/fla/models/utils.py
+@@ -128,6 +128,11 @@ class FLALayer(CacheLayerMixin):
+ 
+         return self.state
+ 
++    def get_max_length(self) -> int:
++        # transformers >= 5.9 CacheLayerMixin: -1 = no maximum; the recurrent state has no
++        # sequence-length dimension.
++        return -1
++
+     def get_seq_length(self, cache_position=None) -> int:
+         return self._seen_tokens
+ 
+diff --git a/fla/ops/backends/__init__.py b/fla/ops/backends/__init__.py
+index 79fc3622..2d5055af 100644
+--- a/fla/ops/backends/__init__.py
++++ b/fla/ops/backends/__init__.py
+@@ -70,7 +70,9 @@ class BaseBackend:
+     @classmethod
+     @cache
+     def can_use(cls) -> bool:
+-        return cls.is_available() and cls.is_enabled()
++        # [LoReS local patch] check is_enabled first: is_available imports tilelang, which can
++        # abort the process, so FLA_TILELANG must be able to prevent that import.
++        return cls.is_enabled() and cls.is_available()
+ 
+     def verify(self, func_name: str, *args, **kwargs) -> tuple[bool, str | None]:
+         """Check if backend can handle the function call."""
+diff --git a/fla/ops/common/backends/tilelang/__init__.py b/fla/ops/common/backends/tilelang/__init__.py
+index 9ba63e4d..aefd6d2e 100644
+--- a/fla/ops/common/backends/tilelang/__init__.py
++++ b/fla/ops/common/backends/tilelang/__init__.py
+@@ -23,6 +23,9 @@ class TileLangBackend(BaseBackend):
+     backend_type = "tilelang"
+     package_name = "tilelang"
+     env_var = "FLA_TILELANG"
++    # [LoReS local patch] opt-in (FLA_TILELANG=1): importing tilelang can abort the process
++    # (tvm::ffi double registration with torch_c_dlpack_ext).
++    default_enable = False
+ 
+     @classmethod
+     def is_available(cls) -> bool:
+diff --git a/fla/ops/kda/backends/tilelang/__init__.py b/fla/ops/kda/backends/tilelang/__init__.py
+index e3305623..c619b28a 100644
+--- a/fla/ops/kda/backends/tilelang/__init__.py
++++ b/fla/ops/kda/backends/tilelang/__init__.py
+@@ -19,6 +19,9 @@ class KDATileLangBackend(BaseBackend):
+     backend_type = "tilelang"
+     package_name = "tilelang"
+     env_var = "FLA_TILELANG"
++    # [LoReS local patch] opt-in (FLA_TILELANG=1): importing tilelang can abort the process
++    # (tvm::ffi double registration with torch_c_dlpack_ext).
++    default_enable = False
+ 
+     @classmethod
+     def is_available(cls) -> bool:

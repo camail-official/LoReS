@@ -1,0 +1,1288 @@
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+index 9f69ab0c7..b6bef519f 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+@@ -37,6 +37,13 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
+     ) -> tuple[bool, str | None]:
+         if not current_platform.is_cuda():
+             return False, "requires CUDA."
++        if compute_capability is None:
++            capability = current_platform.get_device_capability()
++            compute_capability = capability.to_int() if capability else None
++        if compute_capability is not None and compute_capability >= 100:
++            # LINQ: the c3x INT8 scaled_mm is not built for SM100/SM120
++            # ("Int8 not supported on SM120"); the Triton kernel takes over.
++            return False, "CUTLASS INT8 scaled_mm requires SM < 100."
+         return True, None
+ 
+     @classmethod
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 16420dbc6..111cd8f89 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -2219,8 +2219,8 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+             # since the NVFP4 linear layer quantizes internally.
+             if (
+                 use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype()
+-            ) and _kv_b_proj_w_dtype != torch.uint8:
+-                kv_c_normed = kv_c_normed.to(self.kv_b_proj.weight.dtype)
++            ) and _kv_b_proj_w_dtype.is_floating_point:  # LINQ: never cast to a packed/int8 weight dtype (W8A8 int8,
++                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)  # NVFP4 uint8): the quantized linear quantizes its input itself
+ 
+             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
+             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+@@ -2380,7 +2380,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+             )
+             if (
+                 use_fp8_prefill or kv_b_proj_w_dtype != current_platform.fp8_dtype()
+-            ) and kv_b_proj_w_dtype != torch.uint8:
++            ) and kv_b_proj_w_dtype.is_floating_point:  # LINQ: see _compute_prefill_context
+                 kv_c_normed = kv_c_normed.to(kv_b_proj_w_dtype)
+ 
+             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index 02e6c5111..97a150b69 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -381,7 +381,19 @@ class FusedMoEQuantConfig:
+ 
+     @property
+     def use_int8_w8a8(self) -> bool:
+-        return self.quant_dtype == torch.int8
++        return self.quant_dtype == torch.int8 and self._w1.dtype != "int4"
++
++    @property
++    def use_int4_w4a8(self) -> bool:
++        """LINQ: dynamic per-token int8 activations into int4 group-scaled experts."""
++        return self.quant_dtype == torch.int8 and self._w1.dtype == "int4"
++
++    @property
++    def w4a8_block_shape(self) -> list[int]:
++        """The weight group as the fused_experts block_shape ([0, group]); the activations
++        are per token, so `block_shape` itself is None."""
++        assert self.use_int4_w4a8 and self._w1.shape is not None
++        return [0, self._w1.shape.col]
+ 
+     @property
+     def use_int8_w8a16(self) -> bool:
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 62cf12ea2..d4a2ee070 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -872,6 +872,7 @@ def dispatch_fused_moe_kernel(
+     per_channel_quant: bool,
+     block_shape: list[int] | None = None,
+     B_bias: torch.Tensor | None = None,
++    use_int4_w4a8: bool = False,
+ ) -> None:
+     assert topk_weights is not None or not mul_routed_weight
+     assert topk_weights is None or topk_weights.stride(1) == 1
+@@ -880,11 +881,33 @@ def dispatch_fused_moe_kernel(
+     M = A.size(0)
+     num_tokens = M * top_k
+ 
+-    if (use_int8_w8a16 or use_int4_w4a16) and (
++    if (use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8) and (
+         block_shape is not None and block_shape[1] > 0
+     ):
+         assert B_bias is None
+ 
++        if use_int4_w4a8:
++            from lores.kernels.moe.w4a8_vllm import invoke_fused_moe_w4a8_triton_kernel
++
++            invoke_fused_moe_w4a8_triton_kernel(
++                A,
++                B,
++                C,
++                B_scale,
++                B_zp,
++                topk_weights,
++                sorted_token_ids,
++                expert_ids,
++                num_tokens_post_padded,
++                mul_routed_weight,
++                top_k,
++                config,
++                compute_type,
++                block_shape,
++                A_scale=A_scale,
++            )
++            return
++
+         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
+             num_valid_tokens=num_tokens,
+             group_size=block_shape[1],
+@@ -1412,6 +1435,7 @@ def fused_experts_op(
+     block_shape: list[int] | None = None,
+     w1_bias: torch.Tensor | None = None,
+     w2_bias: torch.Tensor | None = None,
++    use_int4_w4a8: bool = False,
+ ) -> torch.Tensor:
+     return fused_experts_impl(
+         hidden_states,
+@@ -1438,6 +1462,7 @@ def fused_experts_op(
+         block_shape,
+         w1_bias,
+         w2_bias,
++        use_int4_w4a8=use_int4_w4a8,
+     )
+ 
+ 
+@@ -1466,6 +1491,7 @@ def fused_experts_op_fake(
+     block_shape: list[int] | None = None,
+     w1_bias: torch.Tensor | None = None,
+     w2_bias: torch.Tensor | None = None,
++    use_int4_w4a8: bool = False,
+ ) -> torch.Tensor:
+     return torch.empty_like(hidden_states)
+ 
+@@ -1554,6 +1580,7 @@ def fused_experts(
+         use_int8_w8a8=quant_config.use_int8_w8a8,
+         use_int8_w8a16=quant_config.use_int8_w8a16,
+         use_int4_w4a16=quant_config.use_int4_w4a16,
++        use_int4_w4a8=quant_config.use_int4_w4a8,
+         ocp_mx_scheme=quant_config.ocp_mx_scheme,
+         per_channel_quant=quant_config.per_act_token_quant,
+         global_num_experts=global_num_experts,
+@@ -1564,7 +1591,7 @@ def fused_experts(
+         w2_zp=quant_config.w2_zp,
+         a1_scale=quant_config.a1_scale,
+         a2_scale=quant_config.a2_scale,
+-        block_shape=quant_config.block_shape,
++        block_shape=quant_config.w4a8_block_shape if quant_config.use_int4_w4a8 else quant_config.block_shape,
+         w1_bias=quant_config.w1_bias,
+         w2_bias=quant_config.w2_bias,
+     )
+@@ -1614,6 +1641,7 @@ def fused_experts_impl(
+     block_shape: list[int] | None = None,
+     w1_bias: torch.Tensor | None = None,
+     w2_bias: torch.Tensor | None = None,
++    use_int4_w4a8: bool = False,
+ ) -> torch.Tensor:
+     if ocp_mx_scheme is not None:
+         raise NotImplementedError(
+@@ -1625,7 +1653,7 @@ def fused_experts_impl(
+     activation_enum = MoEActivation.from_str(activation)
+ 
+     # Check constraints.
+-    if use_int4_w4a16:
++    if use_int4_w4a16 or use_int4_w4a8:
+         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
+     else:
+         assert hidden_states.size(1) == w1.size(2), (
+@@ -1650,7 +1678,7 @@ def fused_experts_impl(
+     config_dtype = _get_config_dtype_str(
+         use_fp8_w8a8=use_fp8_w8a8,
+         use_int8_w8a16=use_int8_w8a16,
+-        use_int4_w4a16=use_int4_w4a16,
++        use_int4_w4a16=use_int4_w4a16 or use_int4_w4a8,
+         dtype=hidden_states.dtype,
+     )
+ 
+@@ -1660,6 +1688,8 @@ def fused_experts_impl(
+         use_fp8_w8a8=use_fp8_w8a8,
+         use_int8_w8a8=use_int8_w8a8,
+     )
++    if use_int4_w4a8:  # LINQ: dynamic per-token int8 activations into the int4 experts
++        quant_dtype = torch.int8
+ 
+     get_config_func = functools.partial(
+         try_get_optimal_moe_config,
+@@ -1671,6 +1701,15 @@ def fused_experts_impl(
+     )
+ 
+     config = get_config_func(M)
++    if use_int4_w4a8:
++        # LINQ: at small M the wna16 default config targets vLLM's CUDA W4A16 kernel
++        # (BLOCK_SIZE_M = min(16, M), no GROUP_SIZE_M); the int8-dot Triton branch needs
++        # a >= 16 M block (tl.dot) and the Triton launch keys. Fix it before the token
++        # alignment below, which pads to BLOCK_SIZE_M.
++        config = dict(config)
++        config["BLOCK_SIZE_M"] = max(16, config["BLOCK_SIZE_M"])
++        config.setdefault("GROUP_SIZE_M", 1)
++        config.setdefault("SPLIT_K", 1)
+ 
+     # We can reuse the memory between these because by the time we need
+     # cache3, we're done with cache1
+@@ -1708,7 +1747,7 @@ def fused_experts_impl(
+         A_scale=a1_scale,
+         quant_dtype=quant_dtype,
+         per_act_token_quant=per_channel_quant,
+-        block_shape=block_shape,
++        block_shape=None if use_int4_w4a8 else block_shape,  # w4a8: block_shape is the weight group
+     )
+ 
+     sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
+@@ -1719,7 +1758,7 @@ def fused_experts_impl(
+         global_num_experts,
+         expert_map,
+         use_int8_w8a16=use_int8_w8a16,
+-        use_int4_w4a16=use_int4_w4a16,
++        use_int4_w4a16=use_int4_w4a16 or use_int4_w4a8,
+         block_shape=block_shape,
+         ignore_invalid_experts=True,
+     )
+@@ -1746,18 +1785,22 @@ def fused_experts_impl(
+         per_channel_quant=per_channel_quant,
+         block_shape=block_shape,
+         B_bias=w1_bias,
++        use_int4_w4a8=use_int4_w4a8,
+     )
+ 
+     apply_moe_activation(
+         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+     )
++    from lores.backends.vllm.rotations import apply_expert_r4
++
++    apply_expert_r4(intermediate_cache2)
+ 
+     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+         A=intermediate_cache2,
+         A_scale=a2_scale,
+         quant_dtype=quant_dtype,
+         per_act_token_quant=per_channel_quant,
+-        block_shape=block_shape,
++        block_shape=None if use_int4_w4a8 else block_shape,
+     )
+ 
+     if expert_map is not None:
+@@ -1785,6 +1828,7 @@ def fused_experts_impl(
+         per_channel_quant=per_channel_quant,
+         block_shape=block_shape,
+         B_bias=w2_bias,
++        use_int4_w4a8=use_int4_w4a8,
+     )
+ 
+     ops.moe_sum(
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 5c188e566..bc57c6b96 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -902,6 +902,9 @@ class FusedMoEExpertsModular(FusedMoEExperts):
+             topk_ids=topk_ids,
+             expert_map=expert_map,
+         )
++        from lores.backends.vllm.rotations import apply_expert_r4
++
++        apply_expert_r4(output)
+ 
+     @abstractmethod
+     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index 80e4064ea..e192bfde2 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -207,6 +207,7 @@ class RoutedExperts(PluggableLayer):
+             "AutoGPTQMoEMethod",
+             "CompressedTensorsWNA16MarlinMoEMethod",
+             "CompressedTensorsWNA16MoEMethod",
++            "LinqW4A8IntMoEMethod",
+             "CompressedTensorsW4A16FlydslMoEMethod",
+         )
+ 
+@@ -628,6 +629,7 @@ class RoutedExperts(PluggableLayer):
+         if quant_method_name in (
+             "CompressedTensorsWNA16MarlinMoEMethod",
+             "CompressedTensorsWNA16MoEMethod",
++            "LinqW4A8IntMoEMethod",
+             "CompressedTensorsWNA16RDNA3MoEMethod",
+             "CompressedTensorsW4A16FlydslMoEMethod",
+         ):
+diff --git a/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py
+index f95aac54f..035ba7159 100644
+--- a/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py
+@@ -217,6 +217,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+             prefix=f"{prefix}.g_b_proj",
+         )
+         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
++        from lores.backends.vllm.rotations import make_ro  # LINQ-WA-ROT
++
++        self.linq_ro = make_ro(projection_size)  # KDA o_proj-input Hadamard (inverse folded at export)
+         self.o_proj = RowParallelLinear(
+             projection_size,
+             self.hidden_size,
+@@ -265,6 +268,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+         )
+         core_attn_out = self.o_norm(core_attn_out, g2)
+         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
++        if self.linq_ro is not None:  # LINQ-WA-ROT
++            core_attn_out = self.linq_ro(core_attn_out)
+         output[:] = self.o_proj(core_attn_out)[0]
+ 
+     def _forward(
+@@ -300,7 +305,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+         g1 = g1[:, :num_actual_tokens]
+         beta = beta[:, :num_actual_tokens]
+ 
+-        (conv_state, recurrent_state) = constant_caches
++        # LINQ-STATE: (conv, codes, scales) under the int state; the fp state is prefill scratch
++        from lores.backends.vllm.state import (
++            linq_bits, linq_kda_decode_vllm, linq_pack_slots, linq_scratch, linq_unpack_slots)
++
++        conv_state = constant_caches[0]
++        recurrent_state = None if linq_bits() else constant_caches[1]
+         # conv_state must be (..., dim, width-1) for the conv kernels.
+         # DS layout stores it that way directly; SD layout needs a transpose.
+         if not is_conv_state_dim_first():
+@@ -394,9 +404,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+         if attn_metadata_narrowed.num_prefills > 0:
+             assert non_spec_state_indices_tensor is not None
+             assert has_initial_state is not None
+-            zero_idx = non_spec_state_indices_tensor[~has_initial_state]
+-            recurrent_state[zero_idx] = 0
+-            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
++            if linq_bits():  # LINQ-STATE: dequantize the slots we continue from into scratch
++                initial_state = linq_unpack_slots(
++                    self, non_spec_state_indices_tensor,
++                    linq_scratch(self, non_spec_state_indices_tensor.shape[0], q.device))
++                initial_state[~has_initial_state, ...] = 0
++            else:
++                zero_idx = non_spec_state_indices_tensor[~has_initial_state]
++                recurrent_state[zero_idx] = 0
++                initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
+             (
+                 core_attn_out_non_spec,
+                 last_recurrent_state,
+@@ -414,7 +430,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 cu_seqlens=non_spec_query_start_loc,
+             )
+             # Init cache
+-            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
++            if linq_bits():  # LINQ-STATE: prefill->decode handoff, pack once per sequence
++                linq_pack_slots(self, non_spec_state_indices_tensor, last_recurrent_state)
++            else:
++                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+         else:
+             assert non_spec_query_start_loc is not None
+             g1 = fused_kda_gate(
+@@ -423,22 +442,29 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 self.head_dim,
+                 g_bias=self.dt_bias,
+             ).unsqueeze(0)
+-            (
+-                core_attn_out_non_spec,
+-                last_recurrent_state,
+-            ) = fused_recurrent_kda(
+-                q=q,
+-                k=k,
+-                v=v,
+-                g=g1,
+-                beta=beta,
+-                initial_state=recurrent_state,
+-                use_qk_l2norm_in_kernel=True,
+-                cu_seqlens=non_spec_query_start_loc[
+-                    : attn_metadata_narrowed.num_decodes + 1
+-                ],
+-                ssm_state_indices=non_spec_state_indices_tensor,
+-            )
++            if linq_bits():  # LINQ-STATE: copy of vLLM's fused_recurrent_kda on the int8 pool
++                core_attn_out_non_spec = linq_kda_decode_vllm(
++                    self, q, k, v, g1, beta,
++                    non_spec_query_start_loc[: attn_metadata_narrowed.num_decodes + 1],
++                    non_spec_state_indices_tensor, seq_lens=attn_metadata_narrowed.seq_lens,
++                )
++            else:
++                (
++                    core_attn_out_non_spec,
++                    last_recurrent_state,
++                ) = fused_recurrent_kda(
++                    q=q,
++                    k=k,
++                    v=v,
++                    g=g1,
++                    beta=beta,
++                    initial_state=recurrent_state,
++                    use_qk_l2norm_in_kernel=True,
++                    cu_seqlens=non_spec_query_start_loc[
++                        : attn_metadata_narrowed.num_decodes + 1
++                    ],
++                    ssm_state_indices=non_spec_state_indices_tensor,
++                )
+         core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+             0, :num_actual_tokens
+         ]
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 567c063bb..0872dd294 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -27,6 +27,14 @@ from vllm.model_executor.layers.linear import (
+     RowParallelLinear,
+ )
+ from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
++from lores.backends.vllm.state import (
++    linq_bits,
++    linq_gdn_decode_packed_vllm,
++    linq_gdn_decode_vllm,
++    linq_pack_slots,
++    linq_scratch,
++    linq_unpack_slots,
++)
+ from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateShapeCalculator,
+@@ -465,6 +473,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             device=current_platform.current_device(),
+         )
+ 
++        self.prefix = prefix  # LINQ-STATE: per-layer SR salt
+         self.out_proj = RowParallelLinear(
+             self.value_dim,
+             self.hidden_size,
+@@ -474,6 +483,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             quant_config=self.quant_config,
+             prefix=f"{prefix}.out_proj",
+         )
++        from lores.backends.vllm.rotations import make_ro  # LINQ-WA-ROT
++
++        self.linq_ro = make_ro(self.value_dim)
+ 
+         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+@@ -787,6 +799,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         core_attn_out = self.norm(core_attn_out, z)
+         core_attn_out = core_attn_out.reshape(z_shape_og)
+         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
++        if self.linq_ro is not None:  # LINQ-WA-ROT: online R_o, inverse folded into out_proj
++            core_attn_out = self.linq_ro(core_attn_out)
+         output, _ = self.out_proj(core_attn_out)
+         return output
+ 
+@@ -932,6 +946,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         core_attn_out = self.norm(core_attn_out, z)
+         core_attn_out = core_attn_out.reshape(z_shape_og)
+         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
++        if self.linq_ro is not None:  # LINQ-WA-ROT
++            core_attn_out = self.linq_ro(core_attn_out)
+         out, _ = self.out_proj(core_attn_out)
+         return out
+ 
+@@ -982,6 +998,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         core_attn_out = self.norm(core_attn_out, z)
+         core_attn_out = core_attn_out.reshape(z_shape_og)
+         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
++        if self.linq_ro is not None:  # LINQ-WA-ROT
++            core_attn_out = self.linq_ro(core_attn_out)
+         out, _ = self.out_proj(core_attn_out)
+         return out
+ 
+@@ -1018,7 +1036,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         dtype = qkv_or_qkvz.dtype
+         num_k_heads = self.num_k_heads // self.tp_size
+         num_v_heads = self.num_v_heads // self.tp_size
+-        _, state_dtype = self.get_state_dtype()
++        state_dtype = self.get_state_dtype()[1]  # LINQ-STATE appends code/scale dtypes
+ 
+         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
+         # is sufficient to populate every autotuner cache. Mirror the real
+@@ -1233,7 +1251,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             if is_conv_state_dim_first()
+             else self_kv_cache[0].transpose(-1, -2)
+         )
+-        ssm_state = self_kv_cache[1]
++        ssm_state = None if linq_bits() else self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
+         num_accepted_tokens = attn_metadata.num_accepted_tokens
+ 
+@@ -1401,22 +1419,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+             )
+-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+-                A_log=self.A_log,
+-                a=a[:num_decode_tokens],
+-                b=b[:num_decode_tokens],
+-                dt_bias=self.dt_bias,
+-                q=query_decode,
+-                k=key_decode,
+-                v=value_decode,
+-                initial_state=ssm_state,
+-                inplace_final_state=True,
+-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+-                    : attn_metadata.num_decodes + 1
+-                ],
+-                ssm_state_indices=non_spec_state_indices_tensor,
+-                use_qk_l2norm_in_kernel=True,
+-            )
++            if linq_bits():  # LINQ-STATE: copy of vLLM's kernel, int8 pool
++                core_attn_out_decode = linq_gdn_decode_vllm(
++                    self, query_decode, key_decode, value_decode, a[:num_decode_tokens], b[:num_decode_tokens],
++                    self.A_log, self.dt_bias, self.head_k_dim**-0.5,
++                    non_spec_query_start_loc[: attn_metadata.num_decodes + 1],  # type: ignore[index]
++                    non_spec_state_indices_tensor, seq_lens=attn_metadata.seq_lens,
++                )
++            else:
++                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
++                    A_log=self.A_log,
++                    a=a[:num_decode_tokens],
++                    b=b[:num_decode_tokens],
++                    dt_bias=self.dt_bias,
++                    q=query_decode,
++                    k=key_decode,
++                    v=value_decode,
++                    initial_state=ssm_state,
++                    inplace_final_state=True,
++                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
++                        : attn_metadata.num_decodes + 1
++                    ],
++                    ssm_state_indices=non_spec_state_indices_tensor,
++                    use_qk_l2norm_in_kernel=True,
++                )
+         else:
+             core_attn_out_decode = None
+ 
+@@ -1430,7 +1456,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
+             assert prefill_state_indices is not None
+             assert prefill_has_initial_state is not None
+-            initial_state = ssm_state[prefill_state_indices]
++            if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
++                initial_state = linq_unpack_slots(
++                    self, prefill_state_indices,
++                    linq_scratch(self, prefill_state_indices.shape[0], query_non_spec.device))
++            else:
++                initial_state = ssm_state[prefill_state_indices]
+             initial_state[~prefill_has_initial_state, ...] = 0
+             (
+                 core_attn_out_non_spec,
+@@ -1449,7 +1480,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 use_qk_l2norm_in_kernel=False,
+             )
+             # Init cache
+-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
++            if linq_bits():  # LINQ-STATE: prefill->decode handoff, pack once per sequence
++                linq_pack_slots(self, prefill_state_indices, last_recurrent_state)
++            else:
++                ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+ 
+             if split_non_spec:
+                 # Stitch the peeled decode outputs in front of the prefill
+@@ -1458,25 +1492,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
+                 )
+         elif attn_metadata.num_decodes > 0:
+-            core_attn_out_non_spec, last_recurrent_state = (
+-                fused_sigmoid_gating_delta_rule_update(
+-                    A_log=self.A_log,
+-                    a=a,
+-                    b=b,
+-                    dt_bias=self.dt_bias,
+-                    q=query_non_spec,
+-                    k=key_non_spec,
+-                    v=value_non_spec,
+-                    initial_state=ssm_state,
+-                    inplace_final_state=True,
+-                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+-                        : attn_metadata.num_decodes
+-                        + 1  # type: ignore[attr-defined]
+-                    ],
+-                    ssm_state_indices=non_spec_state_indices_tensor,
+-                    use_qk_l2norm_in_kernel=True,
++            if linq_bits():  # LINQ-STATE: copy of vLLM's kernel, int8 pool
++                core_attn_out_non_spec = linq_gdn_decode_vllm(
++                    self, query_non_spec, key_non_spec, value_non_spec, a, b, self.A_log, self.dt_bias,
++                    self.head_k_dim**-0.5,
++                    non_spec_query_start_loc[: attn_metadata.num_decodes + 1],  # type: ignore[index]
++                    non_spec_state_indices_tensor, seq_lens=attn_metadata.seq_lens,
++                )
++                last_recurrent_state = None
++            else:
++                core_attn_out_non_spec, last_recurrent_state = (
++                    fused_sigmoid_gating_delta_rule_update(
++                        A_log=self.A_log,
++                        a=a,
++                        b=b,
++                        dt_bias=self.dt_bias,
++                        q=query_non_spec,
++                        k=key_non_spec,
++                        v=value_non_spec,
++                        initial_state=ssm_state,
++                        inplace_final_state=True,
++                        cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
++                            : attn_metadata.num_decodes
++                            + 1  # type: ignore[attr-defined]
++                        ],
++                        ssm_state_indices=non_spec_state_indices_tensor,
++                        use_qk_l2norm_in_kernel=True,
++                    )
+                 )
+-            )
+         else:
+             core_attn_out_non_spec, last_recurrent_state = None, None
+ 
+@@ -1513,7 +1556,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             if is_conv_state_dim_first()
+             else self_kv_cache[0].transpose(-1, -2)
+         )
+-        ssm_state = self_kv_cache[1]
++        ssm_state = None if linq_bits() else self_kv_cache[1]
+ 
+         # 1. Convolution sequence transformation
+         conv_weights = self.conv1d.weight.view(
+@@ -1581,7 +1624,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             if is_conv_state_dim_first()
+             else self_kv_cache[0].transpose(-1, -2)
+         )
+-        ssm_state = self_kv_cache[1]
++        ssm_state = None if linq_bits() else self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
+ 
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+@@ -1601,6 +1644,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             validate_data=False,
+         )
+         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
++        slots = non_spec_state_indices_tensor[:num_actual_tokens]  # type: ignore[index]
++        if linq_bits():  # LINQ-STATE: copy of vLLM's PACKED decode-only kernel, int8 pool
++            linq_gdn_decode_packed_vllm(
++                self, mixed_qkv_non_spec, a, b, self.A_log, self.dt_bias, self.head_k_dim**-0.5, slots, out_buf,
++                seq_lens=attn_metadata.seq_lens,
++            )
++            return
+         fused_recurrent_gated_delta_rule_packed_decode(
+             mixed_qkv=mixed_qkv_non_spec,
+             a=a,
+@@ -1610,7 +1660,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             scale=self.head_k_dim**-0.5,
+             initial_state=ssm_state,
+             out=out_buf,
+-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
++            ssm_state_indices=slots,
+             use_qk_l2norm_in_kernel=True,
+         )
+         return
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index a6524961e..0c6229eff 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -22,6 +22,24 @@ from vllm.model_executor.layers.linear import (
+     RowParallelLinear,
+ )
+ from vllm.model_executor.layers.mamba.abstract import MambaBase
++from lores.backends.vllm.state import (  # LINQ-STATE
++    linq_bits,
++    linq_decode,
++    linq_pack_slots,
++    linq_scratch,
++    linq_unpack_slots,
++)
++from lores.backends.vllm.rotations import (  # LINQ-ROT / LINQ-WA-ROT
++    linq_rot_any,
++    make_ro,
++    mamba2_spec,
++)
++from lores.kernels.rotations.conv_vllm import (  # LINQ-ROT
++    causal_conv1d_fn as causal_conv1d_fn_rot,
++)
++from lores.kernels.rotations.conv_vllm import (  # LINQ-ROT
++    causal_conv1d_update as causal_conv1d_update_rot,
++)
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateDtypeCalculator,
+     MambaStateShapeCalculator,
+@@ -151,13 +169,13 @@ class Mixer2RMSNormGated(CustomOp):
+         gate: torch.Tensor,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         input_dtype = x.dtype
++        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
++            return self.forward_native(x, gate)
++
+         if not self.use_rms_norm:
+             # Keep gate in float32 for numerical stability during silu
+             return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
+ 
+-        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
+-            return self.forward_native(x, gate)
+-
+         return rms_norm_gated(
+             x,
+             self.weight.data,
+@@ -471,9 +489,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
+             quant_config=quant_config,
+             prefix=f"{prefix}.out_proj",
+         )
++        self.linq_ro = make_ro(intermediate_size)  # LINQ-WA-ROT
+ 
+         self.norm = Mixer2RMSNormGated(
+-            intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
++            intermediate_size,
++            n_groups,
++            self.use_rms_norm,
++            eps=rms_norm_eps,
+         )
+ 
+         self._ssd_kernels_warmed_up = False
+@@ -564,6 +586,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
+         hidden_states = self.norm(ssm_output, gate)
+ 
+         # 5. Final linear projection
++        if self.linq_ro is not None:  # LINQ-WA-ROT: online R_o, inverse folded into out_proj
++            hidden_states = self.linq_ro(hidden_states)
+         output, _ = self.out_proj(hidden_states)
+ 
+         return output
+@@ -591,7 +615,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
+ 
+         # Triton's autotuner includes tensor dtypes in its cache key,
+         # so state_dtype must match what real inference uses.
+-        _, ssm_state_dtype = self.get_state_dtype()
++        # LINQ-STATE: the int arms' cache entry [1] is uint8 codes; the fp state they warm up
++        # (and later use as prefill scratch) is fp32.
++        ssm_state_dtype = torch.float32 if linq_bits() else self.get_state_dtype()[1]
+ 
+         # SSD kernel autotune keys depend on dtype and head dimensions,
+         # not on sequence length or batch size, so a single shape suffices.
+@@ -701,7 +727,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                 if is_conv_state_dim_first()
+                 else self.kv_cache[0].transpose(-1, -2)
+             )
+-            ssm_state = self.kv_cache[1]
++            # LINQ-STATE: the int arms have no fp pool -- kv_cache[1:] is codes/scales and the
++            # fp state is per-batch scratch, so nothing below may touch `ssm_state`.
++            ssm_state = None if linq_bits() else self.kv_cache[1]
+             has_initial_states_p = attn_metadata.has_initial_states_p
+             prep_initial_states = attn_metadata.prep_initial_states
+             chunk_size = attn_metadata.chunk_size
+@@ -807,7 +835,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
+             x = hidden_states_B_C_p.transpose(
+                 0, 1
+             )  # this is the form that causal-conv see
+-            hidden_states_B_C_p = causal_conv1d_fn(
++            conv_fn = causal_conv1d_fn
++            rot_kw = {}
++            if linq_rot_any():  # LINQ-ROT: rotate on the way out of the conv
++                sg, l2d, rd = mamba2_spec(self)
++                conv_fn = causal_conv1d_fn_rot
++                rot_kw = {"rot_signs": sg, "rot_log2dim": l2d, "rot_d": rd}
++            hidden_states_B_C_p = conv_fn(
+                 x,
+                 self.conv_weights,
+                 self.conv1d.bias,
+@@ -822,6 +856,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                 block_size_to_align=mamba_block_size,
+                 metadata=attn_metadata,
+                 query_start_loc=query_start_loc_p,
++                **rot_kw,
+             ).transpose(0, 1)[:num_prefill_tokens]
+ 
+             hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(
+@@ -837,11 +872,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                     kernel_ssm_indices = state_indices_tensor_p.gather(
+                         1, block_idx_last_computed_token_p.unsqueeze(1)
+                     ).squeeze(1)
+-                initial_states = torch.where(
+-                    has_initial_states_p[:, None, None, None],
+-                    ssm_state[kernel_ssm_indices],
+-                    0,
+-                )
++                if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
++                    scratch = linq_scratch(self, kernel_ssm_indices.shape[0], hidden_states_p.device)
++                    linq_unpack_slots(self, kernel_ssm_indices, scratch)
++                    initial_states = torch.where(
++                        has_initial_states_p[:, None, None, None], scratch, 0)
++                else:
++                    initial_states = torch.where(
++                        has_initial_states_p[:, None, None, None],
++                        ssm_state[kernel_ssm_indices],
++                        0,
++                    )
+ 
+             # NOTE: final output is an in-place update of out tensor
+             assert preallocated_ssm_out_p is not None
+@@ -866,7 +907,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                 dt_softplus=True,
+                 dt_limit=(0.0, float("inf")),
+                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
+-                state_dtype=ssm_state.dtype,
++                state_dtype=torch.float32 if linq_bits() else ssm_state.dtype,
+             )
+ 
+             if is_mamba_cache_all:
+@@ -953,7 +994,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
+                 #   tensor
+                 assert state_indices_tensor_p is not None
+-                ssm_state[state_indices_tensor_p] = varlen_states
++                if linq_bits():  # LINQ-STATE: prefill->decode handoff into the int pools
++                    linq_pack_slots(self, state_indices_tensor_p, varlen_states)
++                else:
++                    ssm_state[state_indices_tensor_p] = varlen_states
+ 
+         # Process decode requests
+         if has_decode:
+@@ -988,7 +1032,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                 state_indices_tensor_d_output = state_indices_tensor_d
+ 
+             # 2. Convolution sequence transformation
+-            hidden_states_B_C_d = causal_conv1d_update(
++            conv_upd = causal_conv1d_update
++            rot_kw_d = {}
++            if linq_rot_any():  # LINQ-ROT: same rotation as prefill, one basis for the state
++                sg, l2d, rd = mamba2_spec(self)
++                conv_upd = causal_conv1d_update_rot
++                rot_kw_d = {"rot_signs": sg, "rot_log2dim": l2d, "rot_d": rd}
++            hidden_states_B_C_d = conv_upd(
+                 hidden_states_B_C_d,
+                 conv_state,
+                 self.conv_weights,
+@@ -1000,6 +1050,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
+                 num_accepted_tokens=num_accepted_tokens,
+                 query_start_loc=query_start_loc_d,
+                 max_query_len=state_indices_tensor_d.size(-1),
++                **rot_kw_d,
+             )
+ 
+             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
+@@ -1027,34 +1078,52 @@ class MambaMixer2(MambaBase, PluggableLayer):
+             # - mamba_cache_params.ssm_state's slots will be selected
+             #   using state_indices_tensor_d
+             # NOTE: final output is an in-place update of out tensor
+-            selective_state_update(
+-                ssm_state,
+-                hidden_states_d,
+-                dt_d,
+-                A_d,
+-                B_d,
+-                C_d,
+-                D_d,
+-                dt_bias,
+-                dt_softplus=True,
+-                state_batch_indices=state_indices_tensor_d_input,
+-                dst_state_batch_indices=state_indices_tensor_d_output,
+-                out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+-                num_accepted_tokens=num_accepted_tokens,
+-                cu_seqlens=query_start_loc_d,
+-                is_blackwell=self.is_blackwell,
+-            )
+ 
+-    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
++            # LINQ-STATE: decode on the packed-int state pools instead of ssm_state.
++            if linq_bits():
++                linq_decode(
++                    self,
++                    hidden_states_d,
++                    dt_d,
++                    A_d,
++                    B_d,
++                    C_d,
++                    D_d,
++                    dt_bias,
++                    state_indices_tensor_d_input,
++                    preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
++                    seq_lens=attn_metadata.seq_lens,  # decode rows come first; SR seed
++                )
++            else:
++                selective_state_update(
++                    ssm_state,
++                    hidden_states_d,
++                    dt_d,
++                    A_d,
++                    B_d,
++                    C_d,
++                    D_d,
++                    dt_bias,
++                    dt_softplus=True,
++                    state_batch_indices=state_indices_tensor_d_input,
++                    dst_state_batch_indices=state_indices_tensor_d_output,
++                    out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
++                    num_accepted_tokens=num_accepted_tokens,
++                    cu_seqlens=query_start_loc_d,
++                    is_blackwell=self.is_blackwell,
++                )
++
++    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+         assert self.model_config is not None
+         assert self.cache_config is not None
++        # LINQ-STATE: the calculator appends the codes/scales entries when enabled.
+         return MambaStateDtypeCalculator.mamba2_state_dtype(
+             self.model_config.dtype,
+             self.cache_config.mamba_cache_dtype,
+             self.cache_config.mamba_ssm_cache_dtype,
+         )
+ 
+-    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
++    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+         return MambaStateShapeCalculator.mamba2_state_shape(
+             intermediate_size=self.intermediate_size,
+             tp_world_size=get_tensor_model_parallel_world_size(),
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 9e78b8222..80abb6b1d 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -76,9 +76,13 @@ class MambaStateDtypeCalculator:
+         mamba_cache_dtype: MambaDType,
+         mamba_ssm_cache_dtype: MambaDType,
+     ) -> tuple[torch.dtype, ...]:
+-        return cls._mamba_state_dtype(
++        dtypes = cls._mamba_state_dtype(
+             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+         )
++        # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
++        from lores.backends.vllm.state import linq_cache_dtypes
++
++        return linq_cache_dtypes(dtypes)
+ 
+     @classmethod
+     def _mamba_state_dtype(
+@@ -110,10 +114,14 @@ class MambaStateDtypeCalculator:
+         model_dtype: ModelDType | torch.dtype,
+         mamba_cache_dtype: MambaDType,
+         mamba_ssm_cache_dtype: MambaDType = "auto",
+-    ) -> tuple[torch.dtype, torch.dtype]:
+-        return cls._mamba_state_dtype(
++    ) -> tuple[torch.dtype, ...]:
++        dtypes = cls._mamba_state_dtype(
+             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+         )
++        # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
++        from lores.backends.vllm.state import linq_cache_dtypes
++
++        return linq_cache_dtypes(dtypes)
+ 
+     @classmethod
+     def kda_state_dtype(
+@@ -122,7 +130,10 @@ class MambaStateDtypeCalculator:
+         mamba_cache_dtype: MambaDType,
+     ) -> tuple[torch.dtype, torch.dtype]:
+         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+-        return (state_dtype, torch.float32)
++        # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
++        from lores.backends.vllm.state import linq_cache_dtypes
++
++        return linq_cache_dtypes((state_dtype, torch.float32))
+ 
+ 
+ class MambaStateShapeCalculator:
+@@ -184,7 +195,13 @@ class MambaStateShapeCalculator:
+         # - they are typically small
+         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
+         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+-        return conv_state_shape, temporal_state_shape
++
++        # LINQ-STATE: codes + scales per slot; the fp state is prefill scratch and never enters the page.
++        from lores.backends.vllm.state import linq_cache_shapes
++
++        return linq_cache_shapes(
++            conv_state_shape, divide(num_heads, tp_world_size), head_dim, state_size
++        ) or (conv_state_shape, temporal_state_shape)
+ 
+     @classmethod
+     def short_conv_state_shape(
+@@ -231,7 +248,13 @@ class MambaStateShapeCalculator:
+             head_v_dim,
+             head_k_dim,
+         )
+-        return conv_state_shape, temporal_state_shape
++
++        # LINQ-STATE: codes + scales per slot; the fp state is prefill scratch and never enters the page.
++        from lores.backends.vllm.state import linq_cache_shapes
++
++        return linq_cache_shapes(
++            conv_state_shape, divide(num_v_heads, tp_world_size), head_v_dim, head_k_dim
++        ) or (conv_state_shape, temporal_state_shape)
+ 
+     @classmethod
+     def kda_state_shape(
+@@ -257,7 +280,12 @@ class MambaStateShapeCalculator:
+             divide(conv_dim, tp_world_size), conv_kernel_size - 1
+         )
+         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
+-        return (conv_state_shape, recurrent_state_shape)
++        # LINQ-STATE: codes + scales per slot in vLLM's value-major [H, V, K] layout; the fp state is prefill scratch.
++        from lores.backends.vllm.state import linq_cache_shapes
++
++        return linq_cache_shapes(
++            conv_state_shape, divide(num_heads, tp_world_size), head_dim, head_k_dim
++        ) or (conv_state_shape, recurrent_state_shape)
+ 
+ 
+ @dataclass
+diff --git a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+index d348defcc..ac353072c 100644
+--- a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
++++ b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+@@ -77,6 +77,15 @@ def get_ssm_configs(
+     """
+     cache_dtype = _canonical_cache_dtype(cache_dtype)
+     device_name = get_ssm_device_name()
++    from lores.backends.vllm.decode_tuning import override_table
++
++    linq_configs = override_table("mamba_fp")
++    if linq_configs is not None:
++        if (headdim, dstate, cache_dtype, device_name.replace(" ", "_")) != (
++            64, 128, "float32", "NVIDIA_H100_80GB_HBM3"
++        ):
++            raise ValueError("The explicit LoReS serving table requires H100, headdim=64, dstate=128, FP32")
++        return linq_configs
+     json_file_name = get_ssm_config_file_name(headdim, dstate, cache_dtype, device_name)
+ 
+     config_file_paths: list[str] = []
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+index 260a8309f..fba0bd726 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -573,6 +573,9 @@ class CompressedTensorsConfig(QuantizationConfig):
+         )
+         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+         is_symmetric = weight_quant.symmetric and input_quant.symmetric
++        # int4 weights + *fp8* activations; without the type check an int8-activation
++        # W4A8 config (llm-compressor W4A8) is routed to the fp8 kernel on SM90.
++        is_float_act = input_quant.type == QuantizationType.FLOAT
+         # Only per-group symmetric weight (4bit)
+         # + per-tok symmetric activation (8bit) quantization supported.
+         return (
+@@ -581,6 +584,7 @@ class CompressedTensorsConfig(QuantizationConfig):
+             and is_token
+             and is_symmetric
+             and is_dynamic
++            and is_float_act
+         )
+ 
+     @classmethod
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
+index 7c03baf1e..c3d10ef1b 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
+@@ -62,6 +62,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+         weight_quant = scheme_dict.get("weights")
+         input_quant = scheme_dict.get("input_activations")
+         format = scheme_dict.get("format")
++        from lores.backends.vllm.moe import LinqW4A8IntMoEMethod, is_linq_w4a8_int
+ 
+         if quant_config._is_mxfp4(weight_quant):
+             from .compressed_tensors_moe_w4a4_mxfp4 import (
+@@ -221,6 +222,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+             return CompressedTensorsW4A8Fp8MoEMethod(
+                 weight_quant, input_quant, layer.moe_config
+             )
++        elif is_linq_w4a8_int(quant_config, weight_quant, input_quant):
++            # LINQ: the int8-activation W4A8 scheme on CUDA experts (vLLM's own int4/int8
++            # MoE method below is CPU-only)
++            logger.info_once("Using LinqW4A8IntMoEMethod")
++            return LinqW4A8IntMoEMethod(weight_quant, input_quant, layer.moe_config)
+         elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+             from .compressed_tensors_moe_w4a8_int8 import (
+                 CompressedTensorsW4A8Int8MoEMethod,
+diff --git a/vllm/model_executor/models/kimi_linear.py b/vllm/model_executor/models/kimi_linear.py
+index 057d4d01c..87560316a 100644
+--- a/vllm/model_executor/models/kimi_linear.py
++++ b/vllm/model_executor/models/kimi_linear.py
+@@ -29,6 +29,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+     KimiGatedDeltaNetAttention,
+ )
++from lores.backends.vllm.state import linq_set_config
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+     MambaStateCopyFuncCalculator,
+@@ -93,10 +94,15 @@ class KimiMLP(nn.Module):
+                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+             )
+         self.act_fn = SiluAndMul()
++        from lores.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
++
++        self.linq_r4 = make_r4(intermediate_size, prefix)
+ 
+     def forward(self, x):
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
++        if self.linq_r4 is not None:  # LINQ-WA-ROT: online R4, inverse folded into down_proj
++            x = self.linq_r4(x)
+         x, _ = self.down_proj(x)
+         return x
+ 
+@@ -150,6 +156,12 @@ class KimiMoE(nn.Module):
+         else:
+             self.shared_experts = None
+ 
++        from lores.backends.vllm.rotations import linq_set_expert_r4
++        from lores.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
++
++        _r4 = make_r4(moe_intermediate_size, f"{prefix}.experts")  # routed experts: hook inside the MoE kernel
++        if _r4 is not None:
++            linq_set_expert_r4(_r4)
+         self.experts = FusedMoE(
+             shared_experts=self.shared_experts,
+             num_experts=num_experts,
+@@ -602,6 +614,7 @@ class KimiLinearForCausalLM(
+         cls,
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, torch.dtype]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         return MambaStateDtypeCalculator.kda_state_dtype(
+             vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+         )
+@@ -610,6 +623,7 @@ class KimiLinearForCausalLM(
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: "VllmConfig"
+     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_config
+         tp_size = parallel_config.tensor_parallel_size
+diff --git a/vllm/model_executor/models/nemotron_h.py b/vllm/model_executor/models/nemotron_h.py
+index 84f24094a..6ee331cf2 100644
+--- a/vllm/model_executor/models/nemotron_h.py
++++ b/vllm/model_executor/models/nemotron_h.py
+@@ -47,6 +47,7 @@ from vllm.model_executor.layers.linear import (
+ )
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
++from lores.backends.vllm.state import linq_set_config
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+     MambaStateCopyFuncCalculator,
+@@ -113,11 +114,16 @@ class NemotronHMLP(nn.Module):
+             disable_tp=is_sequence_parallel,
+             prefix=f"{prefix}.down_proj",
+         )
++        from lores.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
++
++        self.linq_r4 = make_r4(intermediate_size, prefix)
+         self.act_fn = ReLUSquaredActivation()
+ 
+     def forward(self, x: torch.Tensor):
+         x, _ = self.up_proj(x)
+         x = self.act_fn(x)
++        if self.linq_r4 is not None:  # LINQ-WA-ROT: online (signed) R4, inverse folded into down_proj
++            x = self.linq_r4(x)
+         x, _ = self.down_proj(x)
+         return x
+ 
+@@ -743,6 +749,7 @@ class NemotronHForCausalLM(
+         cls,
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, torch.dtype]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         return MambaStateDtypeCalculator.mamba2_state_dtype(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+@@ -764,6 +771,7 @@ class NemotronHForCausalLM(
+             - conv_state_shape: Shape for convolutional state cache
+             - temporal_state_shape: Shape for state space model cache
+         """
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_config
+         intermediate_size = hf_config.mamba_num_heads * hf_config.mamba_head_dim
+diff --git a/vllm/model_executor/models/qwen2_moe.py b/vllm/model_executor/models/qwen2_moe.py
+index a946159b8..ac1f8d7dc 100644
+--- a/vllm/model_executor/models/qwen2_moe.py
++++ b/vllm/model_executor/models/qwen2_moe.py
+@@ -112,6 +112,9 @@ class Qwen2MoeMLP(nn.Module):
+     def forward(self, x):
+         gate_up, _ = self.gate_up_proj(x)
+         out = self.act_fn(gate_up)
++        linq_r4 = getattr(self, "linq_r4", None)  # LINQ-WA-ROT (set by qwen3_5.py): online R4
++        if linq_r4 is not None:
++            out = linq_r4(out)
+         out, _ = self.down_proj(out)
+ 
+         if self.expert_gate is not None:
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index bcd2576b7..0f301cf37 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -41,6 +41,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+     QwenGatedDeltaNetAttention,
+ )
++from lores.backends.vllm.state import linq_set_config
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+     MambaStateCopyFuncCalculator,
+@@ -169,6 +170,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
+                 quant_config=quant_config,
+                 prefix=f"{prefix}.mlp",
+             )
++            from lores.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
++
++            self.mlp.linq_r4 = make_r4(config.intermediate_size, f"{prefix}.mlp")
+         else:
+             raise ValueError(f"Invalid model_type {config.model_type}")
+ 
+@@ -524,6 +528,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+         cls,
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, torch.dtype]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+@@ -534,6 +539,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: "VllmConfig"
+     ) -> tuple[tuple[int, int], tuple[int, int]]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 50bc4cce1..32f58f8cc 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -36,6 +36,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+     QwenGatedDeltaNetAttention,
+ )
++from lores.backends.vllm.state import linq_set_config
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+     MambaStateCopyFuncCalculator,
+@@ -842,6 +843,7 @@ class Qwen3NextForCausalLM(
+         cls,
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, torch.dtype]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+@@ -852,6 +854,7 @@ class Qwen3NextForCausalLM(
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: "VllmConfig"
+     ) -> tuple[tuple[int, int], tuple[int, int]]:
++        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+index 920efa444..7a929b940 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+@@ -12,6 +12,8 @@ import torch
+ 
+ from vllm.triton_utils import tl, triton
+ 
++from lores.backends.vllm.decode_tuning import gdn_decode_config
++
+ from .op import exp
+ 
+ 
+@@ -437,6 +439,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+     BV = min(triton.next_power_of_2(V), 32)
+     num_stages = 3
+     num_warps = 1
++    BV, num_warps, num_stages = gdn_decode_config(B, (BV, num_warps, num_stages))
+ 
+     stride_mixed_qkv_tok = mixed_qkv.stride(0)
+     stride_a_tok = a.stride(0)
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 70794be07..659ec544b 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -77,6 +77,7 @@ class GDNAttentionMetadata:
+     nums_dict: dict | None = None
+     batch_ptr: torch.Tensor | None = None
+     token_chunk_offset_ptr: torch.Tensor | None = None
++    seq_lens: torch.Tensor | None = None  # LINQ-STATE: per-row SR seed (persistent buffer)
+ 
+ 
+ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
+@@ -509,6 +510,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             nums_dict=nums_dict,
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
++            seq_lens=m.seq_lens,
+         )
+         return attn_metadata
+ 

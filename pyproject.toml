@@ -1,0 +1,143 @@
+[project]
+name = "lores"
+version = "0.1.0"
+description = "Quantization of linear-attention LLMs, built on flash-linear-attention"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lores", "mixerzoo"]
+
+[tool.uv]
+default-groups = ["hf"]
+conflicts = [[{ group = "hf" }, { group = "vllm" }]]
+
+[tool.uv.extra-build-variables]
+# patches/vllm.patch changes Python and Triton source only: reuse the prebuilt binaries of the pinned commit.
+vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "568afb3a13806beb53bb2e6bd518269357b237c0", VLLM_PRECOMPILED_WHEEL_VARIANT = "cu130" }
+
+[tool.uv.sources]
+flash-linear-attention = { path = "libs/flash-linear-attention", editable = true }
+fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform", rev = "e7706faf8d1c3b9f241e36860640ad1dac644ede" }  # v1.1.0.post2 — PyPI sdist ships without csrc/
+vllm = { path = "libs/vllm", editable = true, group = "vllm" }
+torch = [{ index = "pytorch-cu126", group = "hf" }, { index = "pytorch-cu130", group = "vllm" }]
+torchvision = { index = "pytorch-cu126", group = "hf" }
+
+[tool.uv.extra-build-dependencies]
+# The CUDA extensions import torch while building; uv injects the runtime torch into their isolated builds.
+flash-attn = ["setuptools", "ninja", "packaging", { requirement = "torch", match-runtime = true }]
+causal-conv1d = ["setuptools", "ninja", "packaging", { requirement = "torch", match-runtime = true }]
+mamba-ssm = ["setuptools", "ninja", "packaging", { requirement = "torch", match-runtime = true }]
+fast-hadamard-transform = ["setuptools", "ninja", "packaging", { requirement = "torch", match-runtime = true }]
+
+# Git sources have no static metadata; runtime-matched torch needs it.
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.1.0"
+requires-dist = ["ninja", "packaging", "torch"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[dependency-groups]
+hf = [
+    "flash-linear-attention",
+    "numpy==2.2.6; python_full_version < '3.14'",
+    "torch>=2.7.0",
+    "transformers==5.14.1",
+    "accelerate>=0.34",
+    "datasets",
+    "einops",
+    "sentencepiece",
+    "numpy",
+    "tqdm",
+    "lm-eval>=0.4.12",
+    "mamba-ssm>=2.3.1",
+    "flash-attn",
+    "causal-conv1d",
+    "math-verify>=0.9.0",
+    "antlr4-python3-runtime==4.11",
+    "tiktoken>=0.13.0",
+    "blobfile>=3.2.0",
+    "langdetect>=1.0.9",
+    "immutabledict>=4.3.1",
+    "wonderwords>=3.0.1",
+    "nltk>=3.9.4",
+    "fast-hadamard-transform",
+    "torchvision",
+    "llmcompressor>=0.13.0",
+    "matplotlib>=3.11.0",
+]
+vllm = [
+    "vllm",
+    "torch==2.11.0",
+    "transformers==5.15.1",
+    "compressed-tensors==0.17.0",
+    "numpy==2.3.5",
+    "flash-linear-attention",
+    "fast-hadamard-transform",
+    "lm-eval==0.4.12",
+    "datasets==5.0.1",
+    "tiktoken==0.13.0",
+    "blobfile==3.2.0",
+    "langdetect==1.0.9",
+    "immutabledict==4.3.1",
+    "wonderwords==3.0.1",
+    "nltk==3.9.4",
+]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.1",
+    "pre-commit>=4.6.0",
+]
+
+# Default to offline CPU checks. Kernel/backend checks are explicit: pytest tests/gpu.
+[tool.pytest.ini_options]
+testpaths = ["tests/cpu"]
+norecursedirs = ["ref", "libs", ".venv", "build", "cluster", "paper", "docs"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 130
+extend-exclude = [
+    "scripts/grading/nemo_math_grader.py",  # Preserve the vendored NeMo-Skills source and license.
+    "libs/",
+    "mixerzoo/",  # vendored mixer model code (mirrors the fla layer graph) + DCP→HF conversion scripts
+    "ref/",
+    "lores/utils/",
+    "scripts/",
+    "paper/",
+    "docs/",
+    "cluster/",
+]
+
+[tool.ruff.lint]
+select = ["C", "E", "F", "I", "W", "D", "N"]
+# Preserve numerical naming conventions without requiring boilerplate docstrings.
+ignore = ["E741", "W605", "C408", "E402", "F722", "N806", "N803", "D107", "D205", "D417", "C901", "D102", "N802", "N812", "D415"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests don't need docstrings on every helper / class / fixture.
+"tests/**/*.py" = ["D100", "D101", "D102", "D103", "D104"]
+# Preserve the upstream scaffold/style so our serving-kernel copies remain re-diffable.
+"lores/kernels/rotations/conv_vllm.py" = ["D", "I001"]
+"lores/kernels/moe/w4a8_vllm.py" = ["D", "E731"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true

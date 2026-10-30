@@ -1,0 +1,7 @@
+[submodule "libs/flash-linear-attention"]
+	path = libs/flash-linear-attention
+	url = https://github.com/fla-org/flash-linear-attention.git
+
+[submodule "libs/vllm"]
+	path = libs/vllm
+	url = https://github.com/vllm-project/vllm.git
