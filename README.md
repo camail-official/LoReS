@@ -1,7 +1,7 @@
 <h1 align="center">Quantizing recurrent language models is easier than you think</h1>
 
 <p align="center">
-  <a href="TODO-arxiv-link"><img src="https://img.shields.io/badge/Paper-B31B1B?logo=arxiv&logoColor=white" alt="Paper"></a>
+  <a href="https://arxiv.org/pdf/2611.01864"><img src="https://img.shields.io/badge/Paper-B31B1B?logo=arxiv&logoColor=white" alt="Paper"></a>
 </p>
 
 **LoReS** (**Lo**w-bit **Re**current **S**tate) quantizes the recurrent state of linear-recurrent
@@ -66,7 +66,12 @@ are defined in [`mixerzoo/`](mixerzoo/).
 ## Citation
 
 ```bibtex
-TODO
+@misc{nazari2026quantizingrecurrentlanguagemodels,
+      title={Quantizing Recurrent Language Models Is Easier Than You Think}, 
+      author={Philipp Nazari and Neehal Tumma and Daniela Rus and T. Konstantin Rusch},
+      year={2026},
+      url={https://arxiv.org/abs/2611.01864}, 
+}
 ```
 
 ## Dependencies
